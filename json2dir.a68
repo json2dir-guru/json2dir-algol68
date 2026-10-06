@@ -1,0 +1,366 @@
+# json2dir evaluator in ALGOL 68 (Algol 68 Genie).
+  Usage: a68g json2dir.a68 --exit FILE
+  Reads FILE byte by byte, checks strict UTF-8, parses and validates the whole JSON
+  document by hand, then prints a POSIX sh script on stand out. The last line of a
+  complete script is the end marker (a comment line "json2dir: end"). On error a message goes to
+  stand error and the program stops with a non-zero status (and without the marker). #
+
+MODE NODE = STRUCT (INT kind, STRING text, REF [] MEMBER members);
+   # kind: 1 file, 2 link, 3 script, 4 object #
+MODE MEMBER = STRUCT (STRING name, REF NODE value);
+
+PROC fail = (STRING msg) VOID:
+BEGIN
+   put (stand error, ("json2dir: ", msg, new line));
+   # a68g has no "exit with status" procedure; a deliberate runtime error makes it exit 1 #
+   INT zero := 0;
+   print (1 OVER zero)
+END;
+
+# ---- read the input file ---- #
+
+STRING path;
+BEGIN
+   INT found := 0;
+   FOR i TO argc - 1 DO IF argv (i) = "--exit" THEN found := i + 1 FI OD;
+   IF found = 0 OR found /= argc THEN fail ("usage: a68g json2dir.a68 --exit FILE") FI;
+   path := argv (found)
+END;
+
+FLEX [1 : 4096] CHAR buf;
+INT n := 0;
+
+PROC push = (CHAR c) VOID:
+BEGIN
+   IF n = UPB buf THEN
+      [1 : 2 * n] CHAR bigger;
+      bigger[1 : n] := buf[1 : n];
+      buf := bigger
+   FI;
+   n +:= 1;
+   buf[n] := c
+END;
+
+BEGIN
+   FILE f;
+   IF open (f, path, stand in channel) /= 0 THEN fail ("cannot open the input file") FI;
+   BOOL eof := FALSE;
+   # the text channel consumes line feeds and form feeds as line/page ends: record them #
+   on logical file end (f, (REF FILE g) BOOL: (eof := TRUE; TRUE));
+   on line end (f, (REF FILE g) BOOL: (push (REPR 10); FALSE));
+   on page end (f, (REF FILE g) BOOL: (push (REPR 12); FALSE));
+   WHILE NOT eof DO
+      CHAR c := REPR 0;
+      get (f, c);
+      IF NOT eof THEN push (c) FI
+   OD;
+   close (f);
+   # a68g delivers one extra NUL before reporting the end of the file.
+     A real NUL (and a byte 0xFF, which a68g also reads as NUL) is never valid in the
+     input, so any NUL left over makes the UTF-8/JSON check fail as it should. #
+   IF n > 0 THEN IF ABS buf[n] = 0 THEN n -:= 1 FI FI
+END;
+
+# ---- strict UTF-8 ---- #
+
+BEGIN
+   INT i := 1;
+   WHILE i <= n DO
+      INT b = ABS buf[i];
+      INT need := 0, lo := 128, hi := 191;
+      IF b = 0 THEN fail ("input contains a NUL byte")
+      ELIF b < 128 THEN need := 0
+      ELIF b >= 194 AND b <= 223 THEN need := 1
+      ELIF b = 224 THEN need := 2; lo := 160
+      ELIF b >= 225 AND b <= 236 THEN need := 2
+      ELIF b = 237 THEN need := 2; hi := 159
+      ELIF b >= 238 AND b <= 239 THEN need := 2
+      ELIF b = 240 THEN need := 3; lo := 144
+      ELIF b >= 241 AND b <= 243 THEN need := 3
+      ELIF b = 244 THEN need := 3; hi := 143
+      ELSE fail ("input is not valid UTF-8")
+      FI;
+      i +:= 1;
+      TO need DO
+         IF i > n THEN fail ("input is not valid UTF-8") FI;
+         INT x = ABS buf[i];
+         IF x < lo OR x > hi THEN fail ("input is not valid UTF-8") FI;
+         lo := 128; hi := 191;
+         i +:= 1
+      OD
+   OD
+END;
+
+# ---- JSON parser ---- #
+
+INT pos := 1;
+
+PROC peek = INT: IF pos <= n THEN ABS buf[pos] ELSE -1 FI;
+
+PROC skip ws = VOID:
+   WHILE INT c = peek; c = 32 OR c = 9 OR c = 10 OR c = 13 DO pos +:= 1 OD;
+
+PROC hexval = (INT c) INT:
+   IF c >= ABS "0" AND c <= ABS "9" THEN c - ABS "0"
+   ELIF c >= ABS "a" AND c <= ABS "f" THEN c - ABS "a" + 10
+   ELIF c >= ABS "A" AND c <= ABS "F" THEN c - ABS "A" + 10
+   ELSE -1
+   FI;
+
+PROC hex4 = INT:
+BEGIN
+   INT v := 0;
+   TO 4 DO
+      INT h = hexval (peek);
+      IF h < 0 THEN fail ("invalid \u escape") FI;
+      v := v * 16 + h;
+      pos +:= 1
+   OD;
+   v
+END;
+
+PROC parse string = STRING:
+BEGIN
+   IF peek /= ABS """" THEN fail ("expected a string") FI;
+   pos +:= 1;
+   # the decoded bytes never outnumber the raw characters up to the closing quote #
+   INT j := pos;
+   WHILE IF j > n THEN FALSE ELSE buf[j] /= """" FI DO
+      IF buf[j] = "\" THEN j +:= 2 ELSE j +:= 1 FI
+   OD;
+   REF [] CHAR out = HEAP [1 : j - pos + 4] CHAR;
+   INT k := 0;
+   PROC add = (INT b) VOID: (k +:= 1; out[k] := REPR b);
+   PROC add cp = (INT cp) VOID:
+      IF cp < 128 THEN add (cp)
+      ELIF cp < 2048 THEN
+         add (192 + cp OVER 64); add (128 + cp MOD 64)
+      ELIF cp < 65536 THEN
+         add (224 + cp OVER 4096); add (128 + (cp OVER 64) MOD 64); add (128 + cp MOD 64)
+      ELSE
+         add (240 + cp OVER 262144); add (128 + (cp OVER 4096) MOD 64);
+         add (128 + (cp OVER 64) MOD 64); add (128 + cp MOD 64)
+      FI;
+   BOOL done := FALSE;
+   WHILE NOT done DO
+      INT c = peek;
+      IF c < 0 THEN fail ("unterminated string") FI;
+      pos +:= 1;
+      IF c = ABS """" THEN done := TRUE
+      ELIF c < 32 THEN fail ("control character in string")
+      ELIF c /= ABS "\" THEN add (c)
+      ELSE
+         INT e = peek;
+         pos +:= 1;
+         IF e = ABS """" OR e = ABS "\" OR e = ABS "/" THEN add (e)
+         ELIF e = ABS "b" THEN add (8)
+         ELIF e = ABS "f" THEN add (12)
+         ELIF e = ABS "n" THEN add (10)
+         ELIF e = ABS "r" THEN add (13)
+         ELIF e = ABS "t" THEN add (9)
+         ELIF e = ABS "u" THEN
+            INT cp := hex4;
+            IF cp >= 56320 AND cp <= 57343 THEN fail ("unpaired surrogate escape") FI;
+            IF cp >= 55296 AND cp <= 56319 THEN
+               IF peek /= ABS "\" THEN fail ("unpaired surrogate escape") FI;
+               pos +:= 1;
+               IF peek /= ABS "u" THEN fail ("unpaired surrogate escape") FI;
+               pos +:= 1;
+               INT low = hex4;
+               IF low < 56320 OR low > 57343 THEN fail ("unpaired surrogate escape") FI;
+               cp := 65536 + (cp - 55296) * 1024 + (low - 56320)
+            FI;
+            add cp (cp)
+         ELSE fail ("invalid escape in string")
+         FI
+      FI
+   OD;
+   out[1 : k]
+END;
+
+PROC has = (STRING s, CHAR c) BOOL:
+BEGIN
+   BOOL r := FALSE;
+   FOR i FROM LWB s TO UPB s DO IF s[i] = c THEN r := TRUE FI OD;
+   r
+END;
+
+# <0, 0, >0 comparing two names by their UTF-8 bytes #
+PROC cmp = (STRING a, b) INT:
+BEGIN
+   INT la = UPB a - LWB a + 1, lb = UPB b - LWB b + 1;
+   INT r := 0, i := 0;
+   WHILE r = 0 AND i < la AND i < lb DO
+      r := ABS a[LWB a + i] - ABS b[LWB b + i];
+      i +:= 1
+   OD;
+   IF r = 0 THEN la - lb ELSE r FI
+END;
+
+PROC parse value = (INT depth) REF NODE:
+BEGIN
+   IF depth > 400 THEN fail ("the document is nested too deeply") FI;
+   skip ws;
+   INT c = peek;
+   IF c = ABS """" THEN
+      HEAP NODE := (1, parse string, NIL)
+   ELIF c = ABS "[" THEN
+      pos +:= 1;
+      skip ws;
+      STRING tag = parse string;
+      INT kind = IF cmp (tag, "link") = 0 THEN 2
+                 ELIF cmp (tag, "script") = 0 THEN 3
+                 ELSE fail ("an array must be [""link"", target] or [""script"", content]"); 0
+                 FI;
+      skip ws;
+      IF peek /= ABS "," THEN fail ("an array must have exactly two strings") FI;
+      pos +:= 1;
+      skip ws;
+      STRING payload = parse string;
+      skip ws;
+      IF peek /= ABS "]" THEN fail ("an array must have exactly two strings") FI;
+      pos +:= 1;
+      IF kind = 2 THEN
+         IF has (payload, REPR 0) THEN fail ("a link target cannot contain NUL") FI;
+         IF cmp (payload, "") = 0 THEN fail ("a link target cannot be empty") FI
+      FI;
+      HEAP NODE := (kind, payload, NIL)
+   ELIF c = ABS "{" THEN
+      pos +:= 1;
+      skip ws;
+      FLEX [1 : 4] MEMBER ms;
+      INT cnt := 0;
+      IF peek = ABS "}" THEN pos +:= 1
+      ELSE
+         BOOL done := FALSE;
+         WHILE NOT done DO
+            skip ws;
+            STRING name = parse string;
+            IF cmp (name, "") = 0 THEN fail ("empty name") FI;
+            IF cmp (name, ".") = 0 OR cmp (name, "..") = 0 THEN fail ("name . or .. is not allowed") FI;
+            IF has (name, "/") THEN fail ("a name cannot contain /") FI;
+            IF has (name, REPR 0) THEN fail ("a name cannot contain NUL") FI;
+            skip ws;
+            IF peek /= ABS ":" THEN fail ("expected :") FI;
+            pos +:= 1;
+            REF NODE v = parse value (depth + 1);
+            IF cnt = UPB ms THEN
+               [1 : 2 * cnt] MEMBER bigger;
+               bigger[1 : cnt] := ms[1 : cnt];
+               ms := bigger
+            FI;
+            cnt +:= 1;
+            ms[cnt] := (name, v);
+            skip ws;
+            INT d = peek;
+            pos +:= 1;
+            IF d = ABS "}" THEN done := TRUE
+            ELIF d /= ABS "," THEN fail ("expected , or }")
+            FI
+         OD
+      FI;
+      # stable insertion sort by name bytes #
+      FOR i FROM 2 TO cnt DO
+         MEMBER t := ms[i];
+         INT j := i - 1;
+         WHILE IF j < 1 THEN FALSE ELSE cmp (name OF ms[j], name OF t) > 0 FI DO
+            ms[j + 1] := ms[j];
+            j -:= 1
+         OD;
+         ms[j + 1] := t
+      OD;
+      REF [] MEMBER keep = HEAP [1 : cnt] MEMBER;
+      keep := ms[1 : cnt];
+      HEAP NODE := (4, "", keep)
+   ELSE
+      fail ("only objects, strings and [kind, payload] arrays are allowed");
+      NIL
+   FI
+END;
+
+pos := 1;
+# a leading byte order mark is ignored #
+IF n >= 3 THEN
+   IF ABS buf[1] = 239 AND ABS buf[2] = 187 AND ABS buf[3] = 191 THEN pos := 4 FI
+FI;
+skip ws;
+IF peek /= ABS "{" THEN fail ("the root of the document must be an object") FI;
+REF NODE root = parse value (0);
+skip ws;
+IF pos <= n THEN fail ("trailing data after the JSON value") FI;
+
+# ---- shell script ---- #
+
+# single-quoted shell word; NUL bytes split the payload into separate words #
+PROC quote = (STRING s) STRING:
+BEGIN
+   REF [] CHAR out = HEAP [1 : 4 * (UPB s - LWB s + 1) + 2] CHAR;
+   INT k := 1;
+   out[1] := "'";
+   PROC add = (CHAR c) VOID: (k +:= 1; out[k] := c);
+   FOR i FROM LWB s TO UPB s DO
+      CHAR c = s[i];
+      # one CHAR at a time: slice assignments from string denotations proved unreliable in a68g #
+      IF c = "'" THEN add ("'"); add ("\"); add ("'"); add ("'")
+      ELIF ABS c = 0 THEN add ("'"); add (" "); add ("'")
+      ELSE add (c)
+      FI
+   OD;
+   add ("'");
+   out[1 : k]
+END;
+
+PROC emit = (REF NODE obj, STRING dir) VOID:
+BEGIN
+   REF [] MEMBER ms = members OF obj;
+   FOR i TO UPB ms DO
+      # duplicate names: the last occurrence wins (the sort is stable) #
+      BOOL dup = IF i < UPB ms THEN cmp (name OF ms[i], name OF ms[i + 1]) = 0 ELSE FALSE FI;
+      IF NOT dup THEN
+         STRING p = IF cmp (dir, "") = 0 THEN name OF ms[i] ELSE dir + "/" + name OF ms[i] FI;
+         REF NODE v = value OF ms[i];
+         # each piece is printed on its own (simple transput calls, no long row displays) #
+         STRING qp = quote (p);
+         IF kind OF v = 4 THEN
+            print ("_j2d_dir "); print (qp); print (new line);
+            emit (v, p)
+         ELSE
+            STRING cmd = CASE kind OF v IN "_j2d_file ", "_j2d_link ", "_j2d_script " ESAC;
+            STRING qt = quote (text OF v);
+            print (cmd); print (qp); print (" "); print (qt); print (new line)
+         FI
+      FI
+   OD
+END;
+
+[] STRING helpers = (
+   "set -eu",
+   "_j2d_fail() { printf 'json2dir: cannot create %s\n' ""$1"" >&2; exit 1; }",
+   "# Remove an existing non-directory (a symlink itself, never its target);",
+   "# a real directory in the way of a non-object is an error.",
+   "_j2d_clear() {",
+   "  if [ -L ""$1"" ]; then rm -f -- ""$1"" || _j2d_fail ""$1""",
+   "  elif [ -d ""$1"" ]; then printf 'json2dir: a directory is in the way: %s\n' ""$1"" >&2; exit 1",
+   "  elif [ -e ""$1"" ]; then rm -f -- ""$1"" || _j2d_fail ""$1""",
+   "  fi",
+   "}",
+   "_j2d_dir() {",
+   "  if [ -L ""$1"" ] || { [ -e ""$1"" ] && [ ! -d ""$1"" ]; }; then rm -f -- ""$1"" || _j2d_fail ""$1""; fi",
+   "  if [ ! -d ""$1"" ]; then mkdir -- ""$1"" || _j2d_fail ""$1""; fi",
+   "}",
+   "# _j2d_file path part...: the content is the parts joined by NUL bytes.",
+   "_j2d_file() {",
+   "  _j2d_clear ""$1""",
+   "  _j2d_path=$1; shift",
+   "  {",
+   "    printf '%s' ""$1""; shift",
+   "    for _j2d_part in ""$@""; do printf '\000%s' ""$_j2d_part""; done",
+   "  } > ""$_j2d_path"" || _j2d_fail ""$_j2d_path""",
+   "}",
+   "_j2d_script() { _j2d_file ""$@""; chmod a+x -- ""$1"" || _j2d_fail ""$1""; }",
+   "_j2d_link() { _j2d_clear ""$1""; ln -s -- ""$2"" ""$1"" || _j2d_fail ""$1""; }"
+);
+
+FOR i TO UPB helpers DO print ((helpers[i], new line)) OD;
+emit (root, "");
+print (("# json2dir: end", new line))
